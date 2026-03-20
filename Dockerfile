@@ -1,5 +1,5 @@
 # Dockerfile for Drishyam Forensic Engine (v4.0.0)
-FROM python:3.14-slim
+FROM python:3.10-slim
 
 # Install FFmpeg and system libraries for OpenCV
 RUN apt-get update && apt-get install -y \
@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libgl1 \
     libglib2.0-0 \
+    build-essential \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
