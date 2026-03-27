@@ -26,9 +26,9 @@ MODALITY_PROFILES = {
         "name": "Image multi-signal forensics",
         "supports_cross_modal": False,
         "weights": {
-            "metadata": 0.15,
-            "forensic": 0.31,
-            "model": 0.30,
+            "metadata": 0.12,
+            "forensic": 0.29,
+            "model": 0.36,
             "tamper": 0.24,
         },
         "focus": [
@@ -272,9 +272,43 @@ def fuse_signals(signals: dict, file_type: str = "image") -> tuple[float, str, d
                     "signal": "tamper_anchor",
                     "value": round(tamper_anchor, 3),
                     "quality": round(avg_quality, 3),
-                    "effective_weight": 0.0,
-                }
-            )
+                "effective_weight": 0.0,
+            }
+        )
+
+    if file_type == "image" and (
+        "synthetic generation" in manipulation_hints or "synthetic portrait rendering" in manipulation_hints
+    ):
+        synthetic_signal = _normalize_signal(signals.get("model"))
+        if synthetic_signal is not None and synthetic_signal >= 0.60:
+            synthetic_anchor = _clamp((synthetic_signal * 0.84) + 0.06)
+            if synthetic_anchor > final_probability:
+                final_probability = synthetic_anchor
+                audit_trail.append(
+                    {
+                        "signal": "synthetic_anchor",
+                        "value": round(synthetic_anchor, 3),
+                        "quality": round(avg_quality, 3),
+                        "effective_weight": 0.0,
+                    }
+                )
+
+    if file_type == "image":
+        metadata_signal = _normalize_signal(signals.get("metadata"))
+        metadata_diag = signals.get("metadata_diagnostics", {}) or {}
+        raw_provenance_hints = metadata_diag.get("raw_provenance_hints") or []
+        if metadata_signal is not None and metadata_signal >= 0.65 and raw_provenance_hints:
+            provenance_anchor = _clamp((metadata_signal * 0.70) + 0.28)
+            if provenance_anchor > final_probability:
+                final_probability = provenance_anchor
+                audit_trail.append(
+                    {
+                        "signal": "provenance_anchor",
+                        "value": round(provenance_anchor, 3),
+                        "quality": round(avg_quality, 3),
+                        "effective_weight": 0.0,
+                    }
+                )
 
     override_candidates = [
         component

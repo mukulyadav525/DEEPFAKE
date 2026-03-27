@@ -77,6 +77,21 @@ def _extract_image_metadata(path: Path) -> dict:
             if value
         )
 
+        raw_hints = []
+        try:
+            raw = path.read_bytes()
+            raw_lower = raw.lower()
+            provenance_markers = {
+                b"c2pa": "c2pa_provenance",
+                b"synthid": "synthid_watermark",
+                b"google generative ai": "google_generative_ai",
+                b"trainedalgorithmicmedia": "trained_algorithmic_media",
+                b"google c2pa": "google_c2pa",
+            }
+            raw_hints = [label for marker, label in provenance_markers.items() if marker in raw_lower]
+        except Exception:
+            raw_hints = []
+
         return {
             "format": image.format or path.suffix.lstrip(".").upper(),
             "mode": image.mode,
@@ -93,6 +108,7 @@ def _extract_image_metadata(path: Path) -> dict:
             "exif_count": len(exif),
             "metadata_richness": metadata_richness,
             "exif": exif,
+            "raw_provenance_hints": raw_hints,
         }
     except Exception:
         return {
@@ -111,6 +127,7 @@ def _extract_image_metadata(path: Path) -> dict:
             "exif_count": 0,
             "metadata_richness": 0,
             "exif": {},
+            "raw_provenance_hints": [],
         }
 
 
@@ -414,6 +431,94 @@ def _estimate_synthetic_patterns(
     return round(_clamp(score), 3), diagnostics
 
 
+def _estimate_face_portrait_score(rgb) -> tuple[float, dict]:
+    import cv2
+    import numpy as np
+
+    gray_u8 = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    if cascade.empty():
+        return 0.0, {"face_detected": False}
+
+    faces = cascade.detectMultiScale(gray_u8, scaleFactor=1.1, minNeighbors=5, minSize=(96, 96))
+    if len(faces) == 0:
+        return 0.0, {"face_detected": False}
+
+    x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
+    face = gray_u8[y : y + h, x : x + w]
+    if face.size == 0:
+        return 0.0, {"face_detected": False}
+
+    inner_y0 = int(h * 0.12)
+    inner_y1 = max(inner_y0 + 1, int(h * 0.92))
+    inner_x0 = int(w * 0.14)
+    inner_x1 = max(inner_x0 + 1, int(w * 0.86))
+    face_core = face[inner_y0:inner_y1, inner_x0:inner_x1]
+    if face_core.size == 0:
+        face_core = face
+
+    face_f = face_core.astype("float32")
+    core_h, core_w = face_f.shape[:2]
+
+    left_half = face_f[:, : max(core_w // 2, 1)]
+    right_half = face_f[:, face_f.shape[1] - left_half.shape[1] :]
+    right_half = np.fliplr(right_half)
+    common_h = min(left_half.shape[0], right_half.shape[0])
+    common_w = min(left_half.shape[1], right_half.shape[1])
+    left_half = left_half[:common_h, :common_w]
+    right_half = right_half[:common_h, :common_w]
+
+    symmetry_error = float(np.mean(np.abs(left_half - right_half)) / 255.0)
+
+    eye_band = face_f[int(core_h * 0.18) : int(core_h * 0.42), int(core_w * 0.14) : int(core_w * 0.86)]
+    mouth_band = face_f[int(core_h * 0.60) : int(core_h * 0.82), int(core_w * 0.22) : int(core_w * 0.78)]
+    cheek_left = face_f[int(core_h * 0.48) : int(core_h * 0.68), int(core_w * 0.16) : int(core_w * 0.34)]
+    cheek_right = face_f[int(core_h * 0.48) : int(core_h * 0.68), int(core_w * 0.66) : int(core_w * 0.84)]
+    forehead = face_f[int(core_h * 0.16) : int(core_h * 0.28), int(core_w * 0.34) : int(core_w * 0.66)]
+
+    eye_detail = float(cv2.Laplacian(eye_band, cv2.CV_32F).var()) if eye_band.size else 0.0
+    mouth_detail = float(cv2.Laplacian(mouth_band, cv2.CV_32F).var()) if mouth_band.size else 0.0
+
+    skin_patches = [patch for patch in (cheek_left, cheek_right, forehead) if patch.size]
+    skin_texture = float(np.mean([cv2.Laplacian(patch, cv2.CV_32F).var() for patch in skin_patches])) if skin_patches else 0.0
+    feature_detail = max(eye_detail, mouth_detail, 1.0)
+    skin_feature_ratio = float(skin_texture / feature_detail)
+
+    bg_mask = np.ones(gray_u8.shape, dtype=bool)
+    bg_mask[y : y + h, x : x + w] = False
+    background = gray_u8[bg_mask]
+    background_detail = float(background.std()) if background.size else 0.0
+
+    low_skin_texture = _clamp((80.0 - skin_texture) / 80.0)
+    low_skin_feature_ratio = _clamp((0.92 - skin_feature_ratio) / 0.50)
+    high_feature_clarity = _clamp((feature_detail - 45.0) / 80.0)
+    feature_skin_gap = _clamp(((feature_detail - skin_texture) + 10.0) / 55.0)
+    low_symmetry_error = _clamp((0.42 - symmetry_error) / 0.20)
+    blurred_background = _clamp((22.0 - background_detail) / 22.0)
+
+    score = (
+        (low_skin_texture * 0.18)
+        + (low_skin_feature_ratio * 0.24)
+        + (high_feature_clarity * 0.16)
+        + (feature_skin_gap * 0.24)
+        + (low_symmetry_error * 0.10)
+        + (blurred_background * 0.08)
+    )
+
+    diagnostics = {
+        "face_detected": True,
+        "face_box": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+        "symmetry_error": round(symmetry_error, 4),
+        "eye_detail": round(eye_detail, 3),
+        "mouth_detail": round(mouth_detail, 3),
+        "skin_texture": round(skin_texture, 3),
+        "skin_feature_ratio": round(skin_feature_ratio, 3),
+        "background_detail": round(background_detail, 3),
+        "portrait_synthetic_score": round(_clamp(score), 3),
+    }
+    return round(_clamp(score), 3), diagnostics
+
+
 def _extract_image_features(path: Path) -> dict:
     import numpy as np
     from PIL import Image
@@ -460,6 +565,8 @@ def _extract_image_features(path: Path) -> dict:
         entropy_diag,
         resampling_score,
     )
+    portrait_score, portrait_diag = _estimate_face_portrait_score(rgb)
+    synthetic_score = round(_clamp((synthetic_score * 0.72) + (portrait_score * 0.28)), 3)
 
     return {
         "width": int(rgb.shape[1]),
@@ -471,6 +578,7 @@ def _extract_image_features(path: Path) -> dict:
         "resampling_score": resampling_score,
         "halo_score": halo_score,
         "entropy_inconsistency": entropy_diag["inconsistency_score"],
+        "portrait_score": portrait_score,
         "synthetic_score": synthetic_score,
         "pixel_diagnostics": {
             **noise_diag,
@@ -478,6 +586,7 @@ def _extract_image_features(path: Path) -> dict:
             **resampling_diag,
             **halo_diag,
             **synthetic_diag,
+            **portrait_diag,
         },
         "suspicious_regions": (suspicious_regions + noise_regions + entropy_regions + duplicate_regions)[:12],
     }
@@ -491,15 +600,36 @@ def _check_metadata_anomalies(metadata: dict, path: Path) -> tuple[float, list[s
     suffix = path.suffix.lower()
     software = str(metadata.get("software", "") or "")
     alpha_ratio = float(metadata.get("partial_alpha_ratio", 0.0))
+    raw_provenance_hints = list(metadata.get("raw_provenance_hints", []))
 
-    if not exif and suffix in {".jpg", ".jpeg", ".tiff"}:
+    is_camera_native = suffix in {".jpg", ".jpeg", ".tiff"}
+    is_export_friendly = suffix in {".png", ".webp"}
+
+    if not exif and is_camera_native:
         findings.append(
             "No EXIF metadata found in a camera-native format; this is suspicious but not conclusive."
         )
         suspicious += 1.0
 
     editing_tools = ["adobe", "photoshop", "gimp", "canva", "lightroom", "pixelmator", "snapseed"]
-    ai_tools = ["midjourney", "stable diffusion", "dall-e", "comfyui", "automatic1111", "fooocus", "firefly"]
+    ai_tools = [
+        "midjourney",
+        "stable diffusion",
+        "dall-e",
+        "comfyui",
+        "automatic1111",
+        "fooocus",
+        "firefly",
+        "gemini",
+        "imagen",
+        "google ai",
+        "googleai",
+        "bard",
+        "leonardo",
+        "flux",
+        "recraft",
+        "ideogram",
+    ]
 
     software_lower = software.lower()
     if software and any(tool in software_lower for tool in editing_tools):
@@ -511,11 +641,23 @@ def _check_metadata_anomalies(metadata: dict, path: Path) -> tuple[float, list[s
         findings.append(f"AI-generation tooling string found in metadata: {software}")
         suspicious += 1.6
 
+    if raw_provenance_hints:
+        pretty_hints = ", ".join(raw_provenance_hints)
+        findings.append(f"Embedded provenance markers indicate generated media: {pretty_hints}.")
+        suspicious += 2.6
+        ai_metadata = True
+
     camera_make = exif.get("Make")
     camera_model = exif.get("Model")
     if suffix in {".jpg", ".jpeg", ".tiff"} and not camera_make and not camera_model:
         findings.append("No camera make/model present in EXIF.")
         suspicious += 0.6
+
+    if is_export_friendly and not exif and not software:
+        findings.append(
+            "Export-style image format has no provenance metadata; modern AI image tools commonly strip this."
+        )
+        suspicious += 0.45
 
     if software and not camera_make and not camera_model:
         findings.append("Software tag exists without camera identifiers.")
@@ -552,6 +694,7 @@ def _check_metadata_anomalies(metadata: dict, path: Path) -> tuple[float, list[s
         "metadata_richness": metadata.get("metadata_richness"),
         "software": software or None,
         "ai_metadata_hint": ai_metadata,
+        "raw_provenance_hints": raw_provenance_hints,
     }
     return round(_clamp(suspicious / 4.5), 3), findings, diagnostics
 
@@ -629,6 +772,14 @@ async def analyze_image(path: Path) -> dict:
         evidence.append(
             f"Repeated local keypoint patterns suggest possible copy-move editing ({features['duplicate_score']:.0%})."
         )
+    if features["portrait_score"] >= 0.52:
+        pixel_diag = features["pixel_diagnostics"]
+        evidence.append(
+            "Portrait-specific synthesis cues are elevated "
+            f"({features['portrait_score']:.0%}); facial skin texture is unusually smooth "
+            f"relative to feature detail (skin texture {pixel_diag['skin_texture']}, "
+            f"eye detail {pixel_diag['eye_detail']}, symmetry error {pixel_diag['symmetry_error']})."
+        )
     if alpha_composite_score >= 0.45:
         evidence.append(
             f"Transparency/composite cue score is elevated ({alpha_composite_score:.0%})."
@@ -655,6 +806,8 @@ async def analyze_image(path: Path) -> dict:
     if model_score >= 0.68:
         flags.append("Pixel-level deepfake/synthetic image cues are strong.")
         manipulation_hints.append("synthetic generation")
+    if features["portrait_score"] >= 0.60:
+        manipulation_hints.append("synthetic portrait rendering")
     if tamper_score >= 0.62:
         flags.append("Pixel-level tamper cues indicate splicing, cloning, resizing, or object insertion/removal.")
         manipulation_hints.append("localized digital editing")
