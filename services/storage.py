@@ -1,4 +1,5 @@
 import os
+import shutil
 import aiofiles
 from pathlib import Path
 from supabase import create_client, Client
@@ -20,7 +21,12 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-async def save_upload(job_id: str, filename: str, content: bytes) -> dict:
+async def save_upload(
+    job_id: str,
+    filename: str,
+    content: bytes,
+    content_type: str | None = None,
+) -> dict:
     """
     Saves file to local disk (for analysis) AND uploads to Supabase (for persistence).
     Returns a dict with 'local_path' and 'public_url'.
@@ -42,7 +48,7 @@ async def save_upload(job_id: str, filename: str, content: bytes) -> dict:
             supabase.storage.from_(SUPABASE_BUCKET).upload(
                 path=storage_path,
                 file=content,
-                file_options={"content-type": "application/octet-stream"}
+                file_options={"content-type": content_type or "application/octet-stream"}
             )
             # Construct public URL
             public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
@@ -53,3 +59,9 @@ async def save_upload(job_id: str, filename: str, content: bytes) -> dict:
         "local_path": local_path,
         "public_url": public_url
     }
+
+
+def cleanup_upload(job_id: str) -> None:
+    """Remove the local upload directory for a completed job."""
+    job_dir = UPLOAD_DIR / job_id
+    shutil.rmtree(job_dir, ignore_errors=True)

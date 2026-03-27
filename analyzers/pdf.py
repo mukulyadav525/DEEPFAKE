@@ -1,259 +1,449 @@
 """
 analyzers/pdf.py
 
-PDF / Document forensics pipeline.
-
-Checks:
-  1. Metadata inspection (creator, producer, dates)
-  2. Font consistency across pages
-  3. OCR mismatch (if scanned PDF — text layer vs visible content)
-  4. Page-level image forensics (ELA on embedded images)
-  5. NLP style checks (AI-generated text heuristics)
-  6. Hidden objects / invisible layers
+Document forensics for PDF, DOCX, and TXT inputs.
 """
 
+from __future__ import annotations
+
 import asyncio
+import re
+import statistics
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
+from services.model_runtime import infer_text_model
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _extract_pdf_metadata(path: Path) -> tuple[float, list[str], dict]:
-    """Extract and score PDF metadata anomalies."""
-    try:
-        import fitz  # PyMuPDF
+DOCX_NS = {
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+}
 
-        doc = fitz.open(str(path))
-        meta = doc.metadata
-        findings = []
-        suspicious = 0
 
-        creator = meta.get("creator", "")
-        producer = meta.get("producer", "")
-        mod_date = meta.get("modDate", "")
-        creation = meta.get("creationDate", "")
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
 
+
+def _score_text_patterns(text: str) -> tuple[float, list[str], dict]:
+    clean_text = text.strip()
+    if len(clean_text) < 120:
+        return 0.25, ["Not enough text to run strong linguistic analysis."], {}
+
+    words = re.findall(r"[A-Za-z0-9']+", clean_text.lower())
+    if len(words) < 50:
+        return 0.25, ["Text payload is too small for a stable AI-writing estimate."], {}
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", clean_text)
+        if len(sentence.strip().split()) >= 4
+    ]
+    paragraphs = [paragraph.strip() for paragraph in clean_text.splitlines() if len(paragraph.strip()) > 20]
+
+    sentence_lengths = [len(sentence.split()) for sentence in sentences] or [0]
+    paragraph_lengths = [len(paragraph.split()) for paragraph in paragraphs] or [0]
+
+    sentence_variance = statistics.variance(sentence_lengths) if len(sentence_lengths) > 1 else 0.0
+    paragraph_cv = (
+        statistics.pstdev(paragraph_lengths) / (statistics.mean(paragraph_lengths) + 1e-6)
+        if len(paragraph_lengths) > 1
+        else 0.0
+    )
+
+    lexical_diversity = len(set(words)) / max(len(words), 1)
+    bigrams = list(zip(words, words[1:]))
+    max_bigram_share = 0.0
+    if bigrams:
+        from collections import Counter
+
+        bigram_counts = Counter(bigrams)
+        max_bigram_share = max(bigram_counts.values()) / len(bigrams)
+
+    opener_counts = {}
+    for sentence in sentences:
+        opener = " ".join(sentence.lower().split()[:3])
+        if opener:
+            opener_counts[opener] = opener_counts.get(opener, 0) + 1
+    max_opener_repeat = max(opener_counts.values()) if opener_counts else 0
+
+    hedges = [
+        "it is worth noting",
+        "it is important to note",
+        "in conclusion",
+        "in summary",
+        "as an ai",
+        "delve into",
+        "dive deep",
+        "leverage",
+        "utilize",
+        "furthermore",
+        "moreover",
+        "in today's world",
+    ]
+    hit_phrases = [phrase for phrase in hedges if phrase in clean_text.lower()]
+
+    low_sentence_variance = _clamp((25.0 - sentence_variance) / 25.0)
+    low_lexical_diversity = _clamp((0.38 - lexical_diversity) / 0.18)
+    repetition_score = _clamp((max_bigram_share - 0.015) / 0.05)
+    low_paragraph_cv = _clamp((0.35 - paragraph_cv) / 0.35)
+    hedge_score = _clamp((len(hit_phrases) - 2) / 4.0)
+    opener_score = _clamp((max_opener_repeat - 2) / 4.0)
+
+    score = (
+        (low_sentence_variance * 0.20)
+        + (low_lexical_diversity * 0.20)
+        + (repetition_score * 0.20)
+        + (low_paragraph_cv * 0.15)
+        + (hedge_score * 0.15)
+        + (opener_score * 0.10)
+    )
+
+    findings = []
+    if low_sentence_variance >= 0.55:
         findings.append(
-            f"Creator: {creator or 'None'} | Producer: {producer or 'None'}"
+            f"Sentence-length variance is low ({sentence_variance:.1f}), which can indicate templated text."
         )
+    if low_lexical_diversity >= 0.55:
+        findings.append(
+            f"Lexical diversity is low ({lexical_diversity:.2f}), suggesting repetitive wording."
+        )
+    if repetition_score >= 0.45:
+        findings.append(
+            f"Repeated phrase density is elevated (top bigram share {max_bigram_share:.3f})."
+        )
+    if hedge_score >= 0.45:
+        findings.append(f"Several AI-associated discourse markers appear: {', '.join(hit_phrases[:4])}.")
+    if not findings:
+        findings.append("No dominant AI-writing pattern stood out in the text layer.")
 
-        if not creator and not producer:
-            findings.append("No creator/producer metadata — unusual for legitimate documents.")
-            suspicious += 1
-
-        if mod_date and creation and mod_date < creation:
-            findings.append("Modification date precedes creation date — metadata inconsistency.")
-            suspicious += 2
-
-        known_ai_producers = ["ChatGPT", "GPT", "Jasper", "Copy.ai", "Writesonic"]
-        for tool in known_ai_producers:
-            if tool.lower() in (creator + producer).lower():
-                findings.append(f"Known AI writing tool in metadata: {tool}")
-                suspicious += 3
-
-        doc.close()
-        score = min(suspicious / 4.0, 1.0)
-        return round(score, 3), findings, meta
-
-    except Exception as e:
-        return 0.5, [f"Could not parse PDF metadata: {e}"], {}
-
-
-def _check_font_consistency(path: Path) -> tuple[float, list[str]]:
-    """Check if fonts are consistent across pages (inconsistency = possible editing)."""
-    try:
-        import fitz
-
-        doc = fitz.open(str(path))
-        findings = []
-        page_font_sets = []
-
-        for page in doc:
-            fonts = set(f[3] for f in page.get_fonts(full=True))
-            page_font_sets.append(fonts)
-
-        if not page_font_sets:
-            doc.close()
-            return 0.3, ["No font data found."]
-
-        all_fonts = set().union(*page_font_sets)
-        if len(all_fonts) > 8:
-            findings.append(
-                f"Unusually high number of fonts ({len(all_fonts)}) — "
-                "possible cut-and-paste assembly from multiple sources."
-            )
-        else:
-            findings.append(f"Fonts used: {', '.join(list(all_fonts)[:5])}")
-
-        # Check per-page font drift
-        if len(page_font_sets) > 1:
-            base = page_font_sets[0]
-            drifted = sum(1 for pf in page_font_sets[1:] if pf != base)
-            if drifted > len(page_font_sets) * 0.3:
-                findings.append(f"Font changes detected on {drifted} page(s) — possible editing.")
-
-        doc.close()
-        score = min(len(all_fonts) / 15.0, 1.0) if len(all_fonts) > 8 else 0.1
-        return round(score, 3), findings
-
-    except Exception:
-        return 0.3, ["Font analysis failed."]
+    diagnostics = {
+        "sentence_variance": round(sentence_variance, 3),
+        "lexical_diversity": round(lexical_diversity, 3),
+        "max_bigram_share": round(max_bigram_share, 4),
+        "paragraph_cv": round(paragraph_cv, 3),
+        "hedge_hits": len(hit_phrases),
+        "max_opener_repeat": max_opener_repeat,
+    }
+    return round(_clamp(score), 3), findings, diagnostics
 
 
-def _run_document_classifier(all_text: str) -> dict:
-    """
-    [MODEL] NLP classifier for AI-generated text.
-    Checks for perplexity, burstiness, and known LLM fingerprints.
-    """
-    # STUB - Simulating a powerful LLM-detection model
+def _extract_pdf_payload(path: Path) -> dict:
+    import fitz
+
+    doc = fitz.open(str(path))
+    page_count = doc.page_count
+    metadata = doc.metadata or {}
+    creator = metadata.get("creator", "") or ""
+    producer = metadata.get("producer", "") or ""
+    mod_date = metadata.get("modDate", "") or ""
+    creation_date = metadata.get("creationDate", "") or ""
+
+    meta_findings = [
+        f"Pages: {page_count} | Creator: {creator or 'None'} | Producer: {producer or 'None'}"
+    ]
+    meta_suspicious = 0.0
+
+    if not creator and not producer:
+        meta_findings.append("Creator/producer metadata is missing.")
+        meta_suspicious += 0.8
+
+    if mod_date and creation_date and mod_date < creation_date:
+        meta_findings.append("Modification date precedes creation date.")
+        meta_suspicious += 1.2
+
+    known_ai_tools = ["chatgpt", "gpt", "jasper", "copy.ai", "writesonic"]
+    combined_meta = f"{creator} {producer}".lower()
+    for tool in known_ai_tools:
+        if tool in combined_meta:
+            meta_findings.append(f"AI-associated tool string found in metadata: {tool}")
+            meta_suspicious += 1.5
+            break
+
+    all_text = []
+    page_font_sets = []
+    hidden_pages = set()
+    image_heavy_pages = set()
+
+    for page_index, page in enumerate(doc):
+        all_text.append(page.get_text())
+
+        fonts = {font[3] for font in page.get_fonts(full=True) if len(font) > 3 and font[3]}
+        page_font_sets.append(fonts)
+
+        if len(page.get_images(full=True)) >= 4:
+            image_heavy_pages.add(page_index + 1)
+
+        blocks = page.get_text("dict").get("blocks", [])
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("size", 12) < 2:
+                        hidden_pages.add(page_index + 1)
+
+    doc.close()
+
+    all_fonts = set().union(*page_font_sets) if page_font_sets else set()
+    drifted_pages = 0
+    if len(page_font_sets) > 1:
+        base_fonts = page_font_sets[0]
+        drifted_pages = sum(1 for font_set in page_font_sets[1:] if font_set != base_fonts)
+
+    forensic_findings = []
+    forensic_suspicious = 0.0
+    tamper_suspicious = 0.0
+
+    if len(all_fonts) > 8:
+        forensic_findings.append(
+            f"High font diversity detected ({len(all_fonts)} fonts), which can indicate assembled pages."
+        )
+        forensic_suspicious += 1.0
+
+    if drifted_pages > max(1, int(page_count * 0.3)):
+        forensic_findings.append(f"Font usage changes across {drifted_pages} page(s).")
+        forensic_suspicious += 0.8
+        tamper_suspicious += 0.7
+
+    if hidden_pages:
+        forensic_findings.append(f"Very small or hidden text appears on pages: {sorted(hidden_pages)}.")
+        forensic_suspicious += 0.7
+        tamper_suspicious += 1.2
+
+    if image_heavy_pages:
+        forensic_findings.append(f"Image-heavy pages detected: {sorted(image_heavy_pages)}.")
+        forensic_suspicious += 0.5
+
+    if not forensic_findings:
+        forensic_findings.append("PDF structure looks consistent at the page/font layer.")
+
+    suspicious_pages = sorted(hidden_pages | image_heavy_pages)
     return {
-        "gpt_confidence": 0.85,
-        "human_confidence": 0.15,
-        "overall_synthetic": 0.82
+        "document_kind": "pdf",
+        "text": "\n".join(all_text).strip(),
+        "meta_score": round(_clamp(meta_suspicious / 3.0), 3),
+        "meta_findings": meta_findings,
+        "forensic_score": round(_clamp(forensic_suspicious / 3.0), 3),
+        "tamper_score": round(_clamp(tamper_suspicious / 2.0), 3),
+        "forensic_findings": forensic_findings,
+        "suspicious_pages": suspicious_pages,
     }
 
 
-def _check_ai_text_patterns(path: Path) -> tuple[float, list[str]]:
-    """
-    Heuristic NLP check for AI-generated text patterns.
-    For production: integrate GPTZero/Originality API or train a local classifier.
+def _extract_docx_payload(path: Path) -> dict:
+    meta_findings = []
+    forensic_findings = []
+    suspicious_pages = []
 
-    Checks:
-    - Unusual uniformity of sentence lengths
-    - Excessive hedging phrases
-    - Overuse of em dashes and Oxford commas
-    - Burstiness (perplexity variance — low = AI)
-    """
-    try:
-        import fitz
-        import re
+    with zipfile.ZipFile(path) as archive:
+        core_root = None
+        document_root = None
+        document_xml = ""
+        font_names = set()
 
-        doc = fitz.open(str(path))
-        all_text = " ".join(page.get_text() for page in doc)
-        doc.close()
+        if "docProps/core.xml" in archive.namelist():
+            core_root = ET.fromstring(archive.read("docProps/core.xml"))
 
-        if len(all_text.strip()) < 100:
-            return 0.3, ["Not enough text to analyze."]
+        if "word/document.xml" in archive.namelist():
+            raw_document = archive.read("word/document.xml")
+            document_xml = raw_document.decode("utf-8", errors="ignore")
+            document_root = ET.fromstring(raw_document)
 
-        findings = []
-        suspicious = 0
+        if "word/fontTable.xml" in archive.namelist():
+            font_root = ET.fromstring(archive.read("word/fontTable.xml"))
+            for node in font_root.findall(".//w:font", DOCX_NS):
+                name = node.attrib.get(f"{{{DOCX_NS['w']}}}name")
+                if name:
+                    font_names.add(name)
 
-        # Sentence count and length variance
-        sentences = re.split(r'[.!?]+', all_text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-        if sentences:
-            lengths = [len(s.split()) for s in sentences]
-            import statistics
-            variance = statistics.variance(lengths) if len(lengths) > 1 else 0
-            if variance < 20:
-                findings.append(
-                    f"Low sentence-length variance ({variance:.1f}) — "
-                    "consistent with AI-generated prose."
-                )
-                suspicious += 1
+        creator = ""
+        last_modified_by = ""
+        created = ""
+        modified = ""
 
-        # AI hedging phrases
-        hedges = [
-            "it is worth noting", "it is important to note",
-            "in conclusion", "in summary", "as an ai",
-            "delve into", "dive deep", "leverage", "utilize",
-            "furthermore", "moreover", "in today's world"
-        ]
-        hit_phrases = [h for h in hedges if h in all_text.lower()]
-        if len(hit_phrases) >= 3:
-            findings.append(
-                f"Multiple AI-style phrases detected: {', '.join(hit_phrases[:4])}"
+        if core_root is not None:
+            creator = core_root.findtext(".//dc:creator", default="", namespaces=DOCX_NS)
+            last_modified_by = core_root.findtext(
+                ".//cp:lastModifiedBy",
+                default="",
+                namespaces=DOCX_NS,
             )
-            suspicious += 2
+            created = core_root.findtext(".//dcterms:created", default="", namespaces=DOCX_NS)
+            modified = core_root.findtext(".//dcterms:modified", default="", namespaces=DOCX_NS)
 
-        if not findings:
-            findings.append("No strong AI text patterns detected.")
+        meta_findings.append(
+            "Creator: "
+            f"{creator or 'None'} | Last modified by: {last_modified_by or 'None'}"
+        )
 
-        score = min(suspicious / 3.0, 1.0)
-        return round(score, 3), findings
+        meta_suspicious = 0.0
+        if not creator and not last_modified_by:
+            meta_findings.append("DOCX core properties are sparse.")
+            meta_suspicious += 0.7
 
-    except Exception:
-        return 0.3, ["Text analysis failed."]
+        if modified and created and modified < created:
+            meta_findings.append("Modified timestamp precedes created timestamp.")
+            meta_suspicious += 1.0
+
+        actor_fields = f"{creator} {last_modified_by}".lower()
+        if any(tool in actor_fields for tool in ["chatgpt", "gpt", "jasper", "copy.ai"]):
+            meta_findings.append("AI-associated string found in DOCX core properties.")
+            meta_suspicious += 1.4
+
+        text_content = ""
+        revisions = 0
+        comments = 0
+        hidden_runs = 0
+        if document_root is not None:
+            text_nodes = document_root.findall(".//w:t", DOCX_NS)
+            text_content = " ".join((node.text or "") for node in text_nodes)
+            revisions = len(document_root.findall(".//w:ins", DOCX_NS)) + len(
+                document_root.findall(".//w:del", DOCX_NS)
+            )
+            comments = len(document_root.findall(".//w:commentRangeStart", DOCX_NS))
+            hidden_runs = document_xml.count("w:vanish")
+
+        forensic_suspicious = 0.0
+        tamper_suspicious = 0.0
+
+        if len(font_names) > 8:
+            forensic_findings.append(f"Document references many fonts ({len(font_names)}).")
+            forensic_suspicious += 0.8
+
+        if revisions:
+            forensic_findings.append(f"Tracked insert/delete revisions detected ({revisions}).")
+            forensic_suspicious += 0.6
+            tamper_suspicious += 0.8
+
+        if comments:
+            forensic_findings.append(f"Comment anchors detected ({comments}).")
+            tamper_suspicious += 0.4
+
+        if hidden_runs:
+            forensic_findings.append(f"Hidden or vanished text markers detected ({hidden_runs}).")
+            forensic_suspicious += 0.7
+            tamper_suspicious += 1.2
+
+        if not forensic_findings:
+            forensic_findings.append("DOCX structure looks ordinary at the style/revision layer.")
+
+    return {
+        "document_kind": "docx",
+        "text": text_content.strip(),
+        "meta_score": round(_clamp(meta_suspicious / 2.5), 3),
+        "meta_findings": meta_findings,
+        "forensic_score": round(_clamp(forensic_suspicious / 2.5), 3),
+        "tamper_score": round(_clamp(tamper_suspicious / 2.0), 3),
+        "forensic_findings": forensic_findings,
+        "suspicious_pages": suspicious_pages,
+    }
 
 
-def _find_suspicious_pages(path: Path) -> list[int]:
-    """Flag pages with embedded image anomalies or hidden objects."""
-    try:
-        import fitz
+def _extract_txt_payload(path: Path) -> dict:
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    zero_width_count = len(re.findall(r"[\u200B-\u200F\uFEFF]", content))
 
-        doc = fitz.open(str(path))
-        suspicious = []
+    meta_findings = [
+        "Plain text file detected; metadata-based validation is limited.",
+        f"Character count: {len(content)}",
+    ]
+    forensic_findings = []
+    tamper_score = 0.0
 
-        for i, page in enumerate(doc):
-            # Check for invisible / very small text (hidden data)
-            blocks = page.get_text("dict")["blocks"]
-            for b in blocks:
-                if b.get("type") == 0:
-                    for line in b.get("lines", []):
-                        for span in line.get("spans", []):
-                            if span.get("size", 12) < 2:
-                                suspicious.append(i + 1)
-                                break
+    if zero_width_count:
+        forensic_findings.append(f"Zero-width/invisible characters detected ({zero_width_count}).")
+        tamper_score = _clamp((zero_width_count - 1) / 10.0)
+    else:
+        forensic_findings.append("No hidden zero-width characters detected.")
 
-        doc.close()
-        return list(set(suspicious))
-    except Exception:
-        return []
+    return {
+        "document_kind": "txt",
+        "text": content.strip(),
+        "meta_score": 0.10,
+        "meta_findings": meta_findings,
+        "forensic_score": 0.15 if zero_width_count == 0 else round(tamper_score, 3),
+        "tamper_score": round(tamper_score, 3),
+        "forensic_findings": forensic_findings,
+        "suspicious_pages": [],
+    }
 
 
-# ── Main analyzer ────────────────────────────────────────────────────────────
+def _extract_document_payload(path: Path) -> dict:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_pdf_payload(path)
+    if suffix == ".docx":
+        return _extract_docx_payload(path)
+    if suffix == ".txt":
+        return _extract_txt_payload(path)
+    raise ValueError(f"Unsupported document type: {suffix}")
+
 
 async def analyze_pdf(path: Path) -> dict:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    meta_score, meta_findings, raw_meta = await loop.run_in_executor(
-        None, _extract_pdf_metadata, path
+    payload = await loop.run_in_executor(None, _extract_document_payload, path)
+    text_score, text_findings, text_diag = await loop.run_in_executor(
+        None,
+        _score_text_patterns,
+        payload["text"],
     )
-    font_score, font_findings = await loop.run_in_executor(
-        None, _check_font_consistency, path
-    )
-    
-    # Get text for model check
-    import fitz
-    doc = fitz.open(str(path))
-    all_text = " ".join(page.get_text() for page in doc)
-    doc.close()
+    learned_model_result = None
+    if len(payload["text"]) >= 120:
+        learned_model_result = await loop.run_in_executor(None, infer_text_model, payload["text"])
+        if learned_model_result:
+            text_score = round((text_score * 0.45) + (learned_model_result["score"] * 0.55), 3)
 
-    text_score, text_findings = await loop.run_in_executor(
-        None, _check_ai_text_patterns, path
-    )
-    model_result = await loop.run_in_executor(None, _run_document_classifier, all_text)
-    model_score = model_result.get("overall_synthetic", 0.5)
+    evidence = payload["meta_findings"] + payload["forensic_findings"] + text_findings
 
-    suspicious_pages = await loop.run_in_executor(
-        None, _find_suspicious_pages, path
-    )
-
-    evidence = meta_findings + font_findings + text_findings
-
-    if model_score > 0.6:
+    if learned_model_result:
         evidence.append(
-            f"SOTA NLP Model: {model_score:.0%} AI-generation probability "
-            f"(GPT fingerprint detected)."
+            "Learned text-authenticity detector returned "
+            f"{learned_model_result['score']:.0%} suspicious probability "
+            f"via {learned_model_result['source']} ({learned_model_result['label']})."
+        )
+    if text_score >= 0.60:
+        evidence.append(
+            "Text-layer generation score is elevated "
+            f"(lexical diversity {text_diag.get('lexical_diversity', 'n/a')}, "
+            f"sentence variance {text_diag.get('sentence_variance', 'n/a')})."
         )
 
     flags = []
-    if meta_score > 0.7:
-        flags.append("Metadata strongly suggests document manipulation.")
-    if model_score > 0.8:
-        flags.append("Document text contains high-confidence AI-generated patterns.")
-    if suspicious_pages:
-        flags.append(f"Hidden/invisible content found on pages: {suspicious_pages}")
+    manipulation_hints = []
 
-    forensic_score = (font_score + (0.3 if suspicious_pages else 0.0)) / 2.0
+    if payload["meta_score"] >= 0.60:
+        flags.append("Document metadata contains notable inconsistencies.")
+        manipulation_hints.append("metadata inconsistency")
+    if payload["tamper_score"] >= 0.55:
+        flags.append("Document structure indicates possible hidden content or assembly edits.")
+        manipulation_hints.append("document assembly or hidden-content tampering")
+    if text_score >= 0.70:
+        flags.append("Writing pattern score is strongly consistent with AI-generated text.")
+        manipulation_hints.append("AI-generated document text")
+
+    signal_quality = {
+        "metadata": 0.62,
+        "forensic": 0.78,
+        "model": 0.86 if learned_model_result else (0.68 if len(payload["text"]) >= 200 else 0.52),
+        "tamper": 0.82 if payload["suspicious_pages"] else 0.70,
+    }
 
     return {
-        "metadata":   meta_score,
-        "forensic":   round(forensic_score, 3),
-        "model":      model_score,
-        "tamper":     font_score,
+        "metadata": payload["meta_score"],
+        "forensic": payload["forensic_score"],
+        "model": text_score,
+        "tamper": payload["tamper_score"],
         "cross_modal": None,
-        "evidence":   evidence,
-        "flags":      flags,
-        "suspicious_pages": suspicious_pages,
+        "evidence": evidence,
+        "flags": flags,
+        "signal_quality": signal_quality,
+        "manipulation_hints": list(dict.fromkeys(manipulation_hints)),
+        "suspicious_pages": payload["suspicious_pages"],
+        "document_kind": payload["document_kind"],
+        "external_model_evidence": learned_model_result,
     }

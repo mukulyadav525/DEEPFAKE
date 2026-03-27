@@ -1,5 +1,8 @@
-# Dockerfile for Drishyam Forensic Engine (v4.0.0)
+# Dockerfile for Drishyam Forensic Engine (v4.1.0)
 FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 # Install FFmpeg and system libraries for OpenCV
 RUN apt-get update && apt-get install -y \
@@ -28,4 +31,4 @@ RUN mkdir -p uploads
 EXPOSE 8000
 
 # Start Uvicorn (Railway uses the $PORT env var)
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"

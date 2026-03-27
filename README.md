@@ -1,75 +1,101 @@
-# DRISHYAM-ULTIMATE-V3 — Advanced Media Forensics API
+# DRISHYAM Forensics API
 
-A state-of-the-art multi-signal forensics pipeline for detecting AI-generated or manipulated images, audio, video, and PDFs.
+Multi-modal forensic API for detecting AI-generated or digitally altered images, audio, video, PDF, DOCX, and TXT files.
 
-## 🚀 Key Features (v3.0.0 Ultimate)
+## What It Does
 
-- **Cross-Modal Forensics**: Lip-sync (SyncNet) and Acoustic Environment matching.
-- **Consensus-Override Scoring**: High-confidence 'smoking gun' detection.
-- **Forensic Audit Trail**: Detailed lineage showing signal influence for every verdict.
-- **Enterprise Security**: Mandatory `X-API-KEY` protection.
-- **Model Health Dashboard**: Dedicated `/stats` endpoint for performance monitoring.
+- Image: metadata checks, ELA, clone/copy-move cues, resampling/compositing artifacts, pixel-level deepfake signals.
+- Audio: synthetic-voice heuristics, splice detection, waveform and spectral consistency checks.
+- Video: frame forensics, temporal consistency, lip-sync/audio-visual mismatch checks.
+- Documents: metadata, hidden-content, structure, font drift, and AI-writing pattern checks.
+- Hybrid runtime: heuristic pipeline always runs, with optional learned detectors via local Transformers or Hugging Face Inference.
 
-## 📦 Project Structure
+## API Endpoints
 
-```
-forensics-api/
-├── main.py                  ← FastAPI entry point (/analyze, /status, /stats)
-├── requirements.txt
-├── analyzers/
-│   ├── image.py             ← GAN/Diffusion differentiation + ELA
-│   ├── audio.py             ← Spectrogram + Splicing + Env Tone matching
-│   ├── video.py             ← Frame consistency + Lip-Sync (SyncNet)
-│   └── pdf.py               ← Metadata + Font + NLP (GPT Fingerprinting)
-└── services/
-    ├── scoring.py           ← V3.0.0 Ultimate Fusion Engine
-    └── explanation.py       ← V3.0.0 Report Builder (w/ Audit Trail)
-```
+- `POST /analyze-sync`
+  Use this from your main project when you want the final verdict in one request.
+- `POST /analyze`
+  Queues analysis and returns a `job_id`.
+- `GET /status/{job_id}`
+  Poll queued jobs.
+- `GET /health`
+  Railway healthcheck endpoint.
+- `GET /stats`
+  Runtime capabilities and model/deployment status.
 
-## 🛠 Setup
+## Local Run
 
 ```bash
-# Create environment
 python -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Configure API Key (copy from .env.example)
-export DEEPFAKE_API_KEY="drishyam_admin_2026"
-
-# Run the API
+export DEEPFAKE_API_KEY="change-me"
 uvicorn main:app --reload --port 8000
 ```
 
-## 🔌 API Usage
+## Railway Deployment
 
-### 1. File Analysis
+This repo includes:
+
+- [Dockerfile](/Users/mukul/Desktop/DEEPFAKE/Dockerfile)
+- [Procfile](/Users/mukul/Desktop/DEEPFAKE/Procfile)
+- [railway.toml](/Users/mukul/Desktop/DEEPFAKE/railway.toml)
+
+Railway will detect the root `Dockerfile` automatically, which matches Railway’s Dockerfile deployment flow in their docs: [Dockerfiles](https://docs.railway.com/deploy/dockerfiles). Railway also supports config-as-code via `railway.toml`: [Config as Code](https://docs.railway.com/config-as-code).
+
+Set these variables in Railway:
+
 ```bash
-curl -X POST http://localhost:8000/analyze \
-  -H "X-API-KEY: drishyam_admin_2026" \
-  -F "file=@source_media.mp4"
+DEEPFAKE_API_KEY=replace-with-a-secret
+MAX_SIZE_MB=100
+SYNC_MAX_SIZE_MB=30
+JOB_RETENTION_MINUTES=60
+CORS_ALLOW_ORIGINS=https://your-frontend.com
 ```
 
-### 2. Poll Status
+Optional learned-model variables:
+
 ```bash
-curl -H "X-API-KEY: drishyam_admin_2026" \
-  http://localhost:8000/status/{job_id}
+HF_TOKEN=hf_xxx
+HF_IMAGE_MODEL_ID=prithivMLmods/deepfake-detector-model-v1
+HF_AUDIO_MODEL_ID=
+HF_TEXT_MODEL_ID=
+
+LOCAL_IMAGE_MODEL_ID=
+LOCAL_AUDIO_MODEL_ID=
+LOCAL_TEXT_MODEL_ID=
 ```
 
-### 3. Check Base Model Stats
+If no learned-model variables are configured, the service falls back to the built-in forensic ensemble.
+
+## Call It From Your Project
+
+Recommended: call `POST /analyze-sync` for images, PDFs, audio, and smaller uploads.
+
 ```bash
-curl -H "X-API-KEY: drishyam_admin_2026" \
-  http://localhost:8000/stats
+curl -X POST https://your-railway-domain.up.railway.app/analyze-sync \
+  -H "X-API-KEY: replace-with-a-secret" \
+  -F "file=@sample.png"
 ```
 
-## 🧬 Scoring Engine (v3.0.0)
+For larger or slower files like video, use the async workflow:
 
-All signals are fused with **Consensus Override** logic:
-- **Major Signals**: `cross_modal` (40%), `model` (35%), `tamper` (15%).
-- **Override**: Any signal > 0.95 certainty overrides the average for absolute reinforcement.
+```bash
+curl -X POST https://your-railway-domain.up.railway.app/analyze \
+  -H "X-API-KEY: replace-with-a-secret" \
+  -F "file=@sample.mp4"
+```
 
-## 🤝 Project Integration
+Then poll:
 
-To integrate this model directly into your code without the API, see [INTEGRATION.md](file:///Users/mukul/Desktop/DEEPFAKE/INTEGRATION.md).
+```bash
+curl -H "X-API-KEY: replace-with-a-secret" \
+  https://your-railway-domain.up.railway.app/status/<job_id>
+```
+
+## Notes
+
+- Job state is currently in memory, which is fine for a single Railway service instance.
+- For multi-instance scaling or long-lived history, move job state to Redis/Postgres.
+- Local uploaded files are cleaned up after analysis to keep the Railway instance lean.
