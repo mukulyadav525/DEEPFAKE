@@ -1,5 +1,5 @@
 """
-Media Forensics & Authenticity Analyzer — FastAPI Backend
+Media Forensics & Authenticity Analyzer — FastAPI Back
 Run: uvicorn main:app --reload
 """
 
