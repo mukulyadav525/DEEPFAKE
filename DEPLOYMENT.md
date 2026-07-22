@@ -1,4 +1,4 @@
-# Railway Deployment
+# Railway Deploy
 
 This API is ready to deploy on Railway as a Dockerfile service.
 
