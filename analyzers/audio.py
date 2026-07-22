@@ -1,6 +1,4 @@
 """
-analyzers/audio.py
-
 Audio forensics pipeline for synthetic-voice and edit detection.
 """
 
