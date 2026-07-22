@@ -19,7 +19,7 @@ pydub>=0.25.1
 PyMuPDF>=1.24.0       # fitz
 pdfplumber>=0.11.0
 
-# NLP helpers (optional, for advanced text analysis)
+# NLP helpers (optional, for advanced analysis)
 # transformers>=4.40.0
 # torch>=2.3.0
 # onnxruntime>=1.18.0
