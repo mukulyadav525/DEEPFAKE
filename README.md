@@ -1,6 +1,6 @@
 # DRISHYAM Forensics API
 
-Multi-modal forensic API for detecting AI-generated or digitally altered images, audio, video, PDF, DOCX, and TXT files.
+Multi-modal forensic API for detecting AI-generated or digitally altered images, audio, video, PDF, DOCX, and TXT file
 
 ## What It Does
 
