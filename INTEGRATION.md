@@ -1,4 +1,4 @@
-# Integration Guide
+# Integration 
 
 ## Best Option: Call the Railway API
 
