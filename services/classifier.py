@@ -16,7 +16,7 @@ EXTENSION_MAP = {
     ".mp4": "video", ".mov": "video", ".avi": "video",
     ".mkv": "video", ".webm": "video",
 
-    # Documents
+    # doc
     ".pdf": "pdf", ".docx": "pdf", ".txt": "pdf",
 }
 
